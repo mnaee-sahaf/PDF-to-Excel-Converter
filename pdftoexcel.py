@@ -1,21 +1,42 @@
 import os
+import tkinter
+import tkinter as tk
 import pdfplumber
 import pandas as pd
-import tkinter as tk
+import logging
+import threading
 from tkinter import filedialog
 from tkinter import messagebox
 from PyPDF2 import PdfReader
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+
 # Function to normalize headers for comparison
-def normalize_header(header):
+def normalize_header(header: list[str]) -> list[str]:
+    """
+    Normalize the headers by stripping whitespace, converting to lowercase, and replacing newline characters with spaces.
+
+    Args:
+        header (list[str]): List of header strings.
+
+    Returns:
+        list[str]: Normalized list of header strings.
+    """
     if not header:
         return []
     return [col.strip().lower().replace("\n", " ") if col else '' for col in header]
 
 # Function to ensure DataFrame has unique columns
-def ensure_unique_columns(columns):
+def ensure_unique_columns(columns: list[str]) -> list[str]:
     """
-    Ensure that the columns in a DataFrame are unique by appending a suffix to duplicates.
+    Ensure all column names are unique by appending a suffix to duplicates.
+
+    Args:
+        columns (list[str]): List of column names.
+
+    Returns:
+        list[str]: List of unique column names.
     """
     seen = {}
     for i, col in enumerate(columns):
@@ -27,34 +48,72 @@ def ensure_unique_columns(columns):
     return columns
 
 # Function to clean and align DataFrame with existing combined table
-def clean_and_align_dataframe(df, combined_df):
-    # Ensure unique columns before processing
-    df.columns = ensure_unique_columns(list(df.columns))
-    
-    # Find missing columns and add them with empty values
+def clean_and_align_dataframe(df: pd.DataFrame, combined_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean and align a DataFrame with an existing combined DataFrame.
+
+    Args:
+        df (pd.DataFrame): DataFrame to clean and align.
+        combined_df (pd.DataFrame): DataFrame to align with.
+
+    Returns:
+        pd.DataFrame: Aligned DataFrame.
+    """
+    df.columns = ensure_unique_columns(normalize_header(list(df.columns)))
     for col in combined_df.columns:
         if col not in df.columns:
             df[col] = ''
-
-    # Reindex to ensure columns match the combined DataFrame
     df = df[combined_df.columns]
-
     return df
 
 # Function to remove blank rows and rows where the first column is empty
-def remove_blank_rows(df):
-    # Remove rows where all columns are NaN
+def remove_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove rows that are completely blank or where the first column is empty.
+
+    Args:
+        df (pd.DataFrame): DataFrame to clean.
+
+    Returns:
+        pd.DataFrame: Cleaned DataFrame.
+    """
     df = df.dropna(how='all')
-
-    # Remove rows where the first column is NaN or empty
     df = df[df.iloc[:, 0].notna() & (df.iloc[:, 0] != '')]
+    return df
 
+# Function to process DataFrame
+def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Process a DataFrame by normalizing headers and ensuring unique column names.
+
+    Args:
+        df (pd.DataFrame): DataFrame to process.
+
+    Returns:
+        pd.DataFrame: Processed DataFrame.
+    """
+    df.columns = ensure_unique_columns(normalize_header(list(df.columns)))
     return df
 
 # Function to extract tables and save to Excel
-def convert_pdf_to_excel(pdf_path, excel_path):
-    print(f"PDF Path: {pdf_path}")
-    print(f"Excel Path: {excel_path}")
+def convert_pdf_to_excel(pdf_path: str, excel_path: str):
+    """
+    Extract tables from a PDF file and save them to an Excel file.
+
+    Args:
+        pdf_path (str): Path to the PDF file.
+        excel_path (str): Path to save the Excel file.
+
+    Raises:
+        ValueError: If the provided paths are not valid.
+    """
+    if not pdf_path.endswith('.pdf'):
+        raise ValueError("The provided file is not a PDF.")
+    if not excel_path.endswith('.xlsx'):
+        raise ValueError("The output file must have an .xlsx extension.")
+
+    logging.info(f"PDF Path: {pdf_path}")
+    logging.info(f"Excel Path: {excel_path}")
 
     # Check if the directory is writable
     if not os.access(os.path.dirname(excel_path), os.W_OK):
@@ -78,11 +137,11 @@ def convert_pdf_to_excel(pdf_path, excel_path):
                     if any(header):  # Proceed only if there's any valid header content
                         df = pd.DataFrame(table[1:], columns=header)  # Create DataFrame from the table
 
-                        # Ensure columns are unique
-                        df.columns = ensure_unique_columns(list(df.columns))
+                        # Process DataFrame
+                        df = process_dataframe(df)
 
                         # Log the headers for debugging
-                        print(f"Page {page_num + 1} headers: {header}")
+                        logging.info(f"Page {page_num + 1} headers: {header}")
 
                         if header_tuple in tables_by_header:
                             # Align the new DataFrame with the existing combined DataFrame
@@ -94,32 +153,56 @@ def convert_pdf_to_excel(pdf_path, excel_path):
                             # If this header is new, start a new entry in the dictionary
                             tables_by_header[header_tuple] = df
                     else:
-                        print(f"Skipping a table on page {page_num + 1} due to invalid or empty header.")
+                        logging.warning(f"Skipping a table on page {page_num + 1} due to invalid or empty header.")
                 else:
-                    print(f"Skipping a table on page {page_num + 1} due to missing or invalid data.")
+                    logging.warning(f"Skipping a table on page {page_num + 1} due to missing or invalid data.")
 
     # Save grouped tables to Excel
     if tables_by_header:
         try:
+            combined_tables = []
+            for header_tuple, combined_table in tables_by_header.items():
+                combined_table = remove_blank_rows(combined_table)
+                combined_tables.append(combined_table)
+
+            final_combined_table = pd.concat(combined_tables, ignore_index=True)
+
             with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-                for i, (header_tuple, combined_table) in enumerate(tables_by_header.items()):
-                    # Ensure unique columns in the final combined DataFrame
-                    combined_table.columns = ensure_unique_columns(list(combined_table.columns))
+                final_combined_table.to_excel(writer, sheet_name="Combined_Table", index=False)
 
-                    # Remove blank rows and rows where the first column is blank
-                    combined_table = remove_blank_rows(combined_table)
+                # Adjust column widths
+                worksheet = writer.sheets["Combined_Table"]
+                for column in worksheet.columns:
+                    max_length = 0
+                    column = [cell for cell in column]
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = (max_length + 2)  # Adding some padding
+                    worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
 
-                    sheet_name = f"Combined_Table_{i+1}"
-                    combined_table.to_excel(writer, sheet_name=sheet_name, index=False)
+                # Optionally adjust row heights (if needed)
+                for row in worksheet.iter_rows():
+                    max_height = 0
+                    for cell in row:
+                        if cell.value:
+                            max_height = max(max_height, len(str(cell.value).splitlines()))
+                    if max_height > 1:  # Set a minimum height if there are multiple lines
+                        worksheet.row_dimensions[row[0].row].height = max_height * 15  # Adjust height based on content
+
             messagebox.showinfo("Success", f"Tables have been successfully extracted and saved to {excel_path}")
         except Exception as e:
-            print(f"Failed to save Excel file: {e}")
+            logging.error(f"Failed to save Excel file: {e}")
             messagebox.showerror("Error", f"Failed to save Excel file: {e}")
     else:
         messagebox.showinfo("No Tables Found", "No tables were found in the PDF.")
 
 # Function to open file dialog for PDF selection
 def select_pdf():
+    """Open a file dialog to select a PDF file."""
     file_path = filedialog.askopenfilename(title="Select PDF File", filetypes=[("PDF Files", "*.pdf")])
     if file_path:
         pdf_entry.delete(0, tk.END)
@@ -127,6 +210,7 @@ def select_pdf():
 
 # Function to open file dialog for Excel save location
 def select_excel_save_location():
+    """Open a file dialog to select a location to save the Excel file."""
     file_path = filedialog.asksaveasfilename(defaultextension=".xlsx", title="Save Excel File", filetypes=[("Excel Files", "*.xlsx")])
     if file_path:
         excel_entry.delete(0, tk.END)
@@ -134,13 +218,13 @@ def select_excel_save_location():
 
 # Function to start conversion process
 def start_conversion():
+    """Retrieve paths and start the conversion process in a separate thread."""
     pdf_path = pdf_entry.get()
     excel_path = excel_entry.get()
-
     if not pdf_path or not excel_path:
         messagebox.showwarning("Input Required", "Please select both the PDF file and the destination to save the Excel file.")
     else:
-        convert_pdf_to_excel(pdf_path, excel_path)
+        threading.Thread(target=convert_pdf_to_excel, args=(pdf_path, excel_path)).start()
 
 # Setup tkinter window
 root = tk.Tk()
